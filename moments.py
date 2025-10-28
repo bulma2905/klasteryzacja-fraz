@@ -33,7 +33,7 @@ OPENAI_EMBEDDING_MODEL = st.sidebar.selectbox(
 )
 
 OPENAI_CHAT_MODEL = st.sidebar.selectbox(
-    "Model czatu",
+    "Model czatu (dla briefów)",
     ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"],
     index=0
 )
@@ -179,93 +179,6 @@ def global_deduplicate_clusters(clusters: Dict[int, List[str]], threshold: int =
             new_clusters[cid] = unique_qs
     return new_clusters
 
-def validate_clusters_with_llm(clusters: Dict[int, List[str]], client: OpenAI, model: str = "gpt-4o-mini") -> Dict[int, List[str]]:
-    if not clusters:
-        return clusters
-
-    id2cid = {i: cid for i, cid in enumerate(clusters.keys())}
-    clusters_list = [f"Cluster {i}: {', '.join(qs)}" for i, (cid, qs) in enumerate(clusters.items())]
-
-    prompt = f"""
-Masz listę klastrów fraz. Twoim zadaniem jest sprawdzić, czy któreś klastry znaczą to samo.
-⚠️ Bardzo ważne zasady:
-- Scalaj TYLKO wtedy, gdy frazy są prawie identyczne (synonimy, odmiana, szyk słów).
-- NIE łącz klastrów, jeśli dotyczą różnych kontekstów (np. ceny ≠ dzieci, gotowanie ≠ ceny).
-- Uwzględnij lematyzację – jeśli frazy różnią się tylko formą gramatyczną, SCAL je.
-- Unikaj łączenia, które mogłoby prowadzić do kanibalizacji SEO (dwa różne tematy artykułów nie mogą być scalone).
-- Jeżeli masz wątpliwości, NIE scalaj.
-
-Lista klastrów:
-{chr(10).join(clusters_list)}
-
-Odpowiedz w JSON, w formacie:
-{{
-  "scalone": [
-    {{"id": [0, 3]}},
-    {{"id": [1]}},
-    {{"id": [2, 5]}}
-  ]
-}}
-"""
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "Jesteś asystentem SEO. Zwracasz tylko czysty JSON zgodny z formatem."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0,
-        )
-        content = resp.choices[0].message.content.strip()
-        st.subheader("📑 Surowa odpowiedź LLM (walidacja klastrów)")
-        st.code(content, language="json")
-
-        start = content.find("{")
-        end = content.rfind("}")
-        if start != -1 and end != -1:
-            json_str = content[start:end+1]
-        else:
-            raise ValueError("⚠️ Brak poprawnego JSON w odpowiedzi LLM")
-
-        data = json.loads(json_str)
-
-        merged: Dict[int, List[str]] = {}
-        scalone_info = []
-        new_id = 0
-        used_ids = set()
-
-        for group in data.get("scalone", []):
-            combined = []
-            ids = group.get("id", [])
-            for idx in ids:
-                cid = id2cid.get(idx)
-                if cid in clusters:
-                    combined.extend(clusters[cid])
-                    used_ids.add(idx)
-            if combined:
-                merged[new_id] = combined
-                scalone_info.append(f"Scalono klastry {ids} → {combined}")
-                new_id += 1
-
-        all_ids = set(id2cid.keys())
-        leftover_ids = all_ids - used_ids
-        for idx in leftover_ids:
-            cid = id2cid.get(idx)
-            if cid in clusters:
-                merged[new_id] = clusters[cid]
-                scalone_info.append(f"Zachowano klaster {idx} → {clusters[cid]}")
-                new_id += 1
-
-        if scalone_info:
-            st.subheader("📊 Raport scalania klastrów")
-            for line in scalone_info:
-                st.write(line)
-
-        return merged if merged else clusters
-    except Exception as e:
-        logging.warning(f"⚠️ Cluster validation with LLM failed: {e}")
-        return clusters
-
 def generate_article_brief(questions: List[str], client: OpenAI | None, model: str = "gpt-4o-mini") -> Dict[str, Any]:
     if client is None:
         return {"intencja": "", "frazy": ", ".join(questions), "tytul": "", "wytyczne": ""}
@@ -359,8 +272,8 @@ if st.sidebar.button("Uruchom grupowanie"):
     clusters = global_deduplicate_clusters(clusters, threshold=90)
     update_status(f"🧽 Usuwanie duplikatów między klastrami: {len(clusters)} końcowych klastrów", 85)
 
-    clusters = validate_clusters_with_llm(clusters, openai_client, model=OPENAI_CHAT_MODEL)
-    update_status(f"🤖 Walidacja LLM: {len(clusters)} klastrów po scaleniu semantycznym", 90)
+    # ⛔ Pominięto walidację LLM
+    update_status(f"✅ Pominięto walidację LLM – pozostawiono {len(clusters)} klastrów po klasycznym scaleniu", 90)
 
     rows = []
     total = len(clusters)
@@ -369,7 +282,7 @@ if st.sidebar.button("Uruchom grupowanie"):
         brief = generate_article_brief(qs, openai_client, model=OPENAI_CHAT_MODEL)
         rows.append({
             "cluster_id": label,
-            "main_phrase": qs[0] if qs else "",   # fraza główna
+            "main_phrase": qs[0] if qs else "",
             "intencja": brief.get("intencja", ""),
             "frazy": ", ".join(qs),
             "tytul": brief.get("tytul", ""),
@@ -397,3 +310,4 @@ if "excel_buffer" in st.session_state:
     st.success("✅ Zakończono przetwarzanie.")
     st.subheader("📊 Podgląd wyników")
     st.dataframe(pd.DataFrame(st.session_state["results"]))
+
