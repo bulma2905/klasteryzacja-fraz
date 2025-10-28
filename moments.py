@@ -1,6 +1,9 @@
 import io
 import logging
 import json
+import os
+import pickle
+import time
 from typing import List, Dict, Any
 
 import numpy as np
@@ -59,15 +62,9 @@ USE_SEMHASH = st.sidebar.checkbox("Użyj SemHash do deduplikacji", value=False)
 st.sidebar.markdown("### ℹ️ Objaśnienia parametrów")
 st.sidebar.info("""
 **Deduplication Threshold (RapidFuzz)** – próg podobieństwa (0–100), powyżej którego frazy są traktowane jako duplikaty.  
-Przykład: „gotowanie kukurydzy” i „jak gotować kukurydzę” przy 85 będą scalone.
-
-**Initial Clustering Similarity Threshold** – minimalne podobieństwo (0–1), żeby frazy trafiły do tego samego klastra na początku.  
-Niższa wartość = większe grupy.
-
-**Cluster Merge Similarity Threshold** – próg podobieństwa (0–1), przy którym łączymy całe klastry w większe grupy.  
-Wyższa wartość = mniej łączenia.
-
-**SemHash Similarity Threshold** – używane, gdy zaznaczysz opcję SemHash. Określa, jak semantycznie bliskie muszą być frazy, żeby uznać je za duplikaty.
+**Initial Clustering Similarity Threshold** – minimalne podobieństwo (0–1), żeby frazy trafiły do tego samego klastra.  
+**Cluster Merge Similarity Threshold** – próg podobieństwa (0–1), przy którym łączymy klastry.  
+**SemHash Similarity Threshold** – jeśli użyjesz SemHash, określa jak bliskie semantycznie muszą być frazy, żeby uznać je za duplikaty.
 """)
 
 # -----------------------------
@@ -237,6 +234,22 @@ def update_status(message: str, progress: int):
 
 phrases_input = st.sidebar.text_area("Wklej frazy, jedna na linię:")
 
+# -----------------------------
+# Checkpoint helpers
+# -----------------------------
+def save_checkpoint(data, filename="briefs.pkl"):
+    with open(filename, "wb") as f:
+        pickle.dump(data, f)
+
+def load_checkpoint(filename="briefs.pkl"):
+    if os.path.exists(filename):
+        with open(filename, "rb") as f:
+            return pickle.load(f)
+    return []
+
+# -----------------------------
+# Główna logika aplikacji
+# -----------------------------
 if st.sidebar.button("Uruchom grupowanie"):
     if not phrases_input.strip():
         st.warning("⚠️ Wklej najpierw listę fraz.")
@@ -272,23 +285,45 @@ if st.sidebar.button("Uruchom grupowanie"):
     clusters = global_deduplicate_clusters(clusters, threshold=90)
     update_status(f"🧽 Usuwanie duplikatów między klastrami: {len(clusters)} końcowych klastrów", 85)
 
-    # ⛔ Pominięto walidację LLM
     update_status(f"✅ Pominięto walidację LLM – pozostawiono {len(clusters)} klastrów po klasycznym scaleniu", 90)
 
-    rows = []
+    # -----------------------------
+    # Wczytaj checkpoint i generuj briefy z zabezpieczeniem
+    # -----------------------------
+    rows = load_checkpoint()
+    done = len(rows)
     total = len(clusters)
-    for i, (label, qs) in enumerate(clusters.items(), 1):
-        update_status(f"📝 Generuję brief {i}/{total} ({len(qs)} fraz)", int(95 * i / total))
-        brief = generate_article_brief(qs, openai_client, model=OPENAI_CHAT_MODEL)
-        rows.append({
-            "cluster_id": label,
-            "main_phrase": qs[0] if qs else "",
-            "intencja": brief.get("intencja", ""),
-            "frazy": ", ".join(qs),
-            "tytul": brief.get("tytul", ""),
-            "wytyczne": brief.get("wytyczne", ""),
-        })
+    if done > 0:
+        update_status(f"🔁 Wczytano {done} gotowych briefów z checkpointa", 90)
+    else:
+        update_status("📝 Rozpoczynam generowanie briefów od początku", 90)
 
+    for i, (label, qs) in enumerate(clusters.items(), 1):
+        if i <= done:
+            continue
+        try:
+            update_status(f"📝 Generuję brief {i}/{total} ({len(qs)} fraz)", int(95 * i / total))
+            brief = generate_article_brief(qs, openai_client, model=OPENAI_CHAT_MODEL)
+            rows.append({
+                "cluster_id": label,
+                "main_phrase": qs[0] if qs else "",
+                "intencja": brief.get("intencja", ""),
+                "frazy": ", ".join(qs),
+                "tytul": brief.get("tytul", ""),
+                "wytyczne": brief.get("wytyczne", ""),
+            })
+            save_checkpoint(rows)
+            time.sleep(1.5)
+        except Exception as e:
+            logging.warning(f"⚠️ Błąd przy klastrze {i}/{total}: {e}")
+            time.sleep(3)
+            continue
+
+    update_status("✅ Wszystkie briefy wygenerowane lub wczytane z checkpointa", 98)
+
+    # -----------------------------
+    # Zapis do Excela
+    # -----------------------------
     df = pd.DataFrame(rows)
     xlsx_buffer = io.BytesIO()
     with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
@@ -310,4 +345,5 @@ if "excel_buffer" in st.session_state:
     st.success("✅ Zakończono przetwarzanie.")
     st.subheader("📊 Podgląd wyników")
     st.dataframe(pd.DataFrame(st.session_state["results"]))
+
 
