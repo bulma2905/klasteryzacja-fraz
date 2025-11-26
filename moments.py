@@ -57,6 +57,16 @@ SEMHASH_SIM = st.sidebar.slider(
 USE_SEMHASH = st.sidebar.checkbox("Użyj SemHash do deduplikacji", value=False)
 
 # -----------------------------
+# NOWA FUNKCJA: WYCZYSZCZENIE CHECKPOINTA
+# -----------------------------
+if st.sidebar.button("🗑️ Wyczyść checkpoint"):
+    if os.path.exists("briefs.pkl"):
+        os.remove("briefs.pkl")
+        st.sidebar.success("Checkpoint został usunięty! 🔥")
+    else:
+        st.sidebar.info("Brak pliku checkpointa do usunięcia.")
+
+# -----------------------------
 # Parametry – objaśnienia
 # -----------------------------
 st.sidebar.markdown("### ℹ️ Objaśnienia parametrów")
@@ -288,11 +298,12 @@ if st.sidebar.button("Uruchom grupowanie"):
     update_status(f"✅ Pominięto walidację LLM – pozostawiono {len(clusters)} klastrów po klasycznym scaleniu", 90)
 
     # -----------------------------
-    # Wczytaj checkpoint i generuj briefy z zabezpieczeniem
+    # Wczytaj checkpoint i generuj briefy
     # -----------------------------
     rows = load_checkpoint()
     done = len(rows)
     total = len(clusters)
+
     if done > 0:
         update_status(f"🔁 Wczytano {done} gotowych briefów z checkpointa", 90)
     else:
@@ -345,5 +356,6 @@ if "excel_buffer" in st.session_state:
     st.success("✅ Zakończono przetwarzanie.")
     st.subheader("📊 Podgląd wyników")
     st.dataframe(pd.DataFrame(st.session_state["results"]))
+
 
 
