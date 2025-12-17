@@ -218,6 +218,29 @@ def global_deduplicate_clusters(clusters: Dict[int, List[str]], threshold: int =
 def pick_main_phrase(qs: List[str]) -> str:
     return sorted(qs, key=lambda x: (len(normalize_phrase(x)), len(str(x))))[0] if qs else ""
 
+# ✅ DODANE: przywracanie „wywalonych” fraz do najbliższego klastra (żeby nie przepadały)
+def assign_raw_phrases_to_clusters(raw_phrases: List[str], clusters: Dict[int, List[str]], threshold: int = 92) -> Dict[int, List[str]]:
+    out = {cid: list(qs) for cid, qs in clusters.items()}
+    cluster_norm = {cid: [normalize_phrase(q) for q in qs] for cid, qs in clusters.items()}
+
+    for rp in raw_phrases:
+        nrp = normalize_phrase(rp)
+        best_cid, best_sim = None, 0
+        for cid, norms in cluster_norm.items():
+            if not norms:
+                continue
+            sim = max(fuzz.token_set_ratio(nrp, n) for n in norms)
+            if sim > best_sim:
+                best_sim = sim
+                best_cid = cid
+        if best_cid is not None and best_sim >= threshold:
+            out[best_cid].append(rp)
+
+    # usuń duplikaty literalne, zachowaj kolejność
+    for cid in out:
+        out[cid] = list(dict.fromkeys(out[cid]))
+    return out
+
 def generate_article_brief(questions: List[str], client: OpenAI | None, model: str = "gpt-4o-mini") -> Dict[str, Any]:
     if client is None:
         return {"intencja": "", "frazy": ", ".join(questions), "tytul": "", "wytyczne": ""}
@@ -303,7 +326,9 @@ if st.sidebar.button("Uruchom grupowanie"):
 
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-    questions = [line.strip() for line in phrases_input.splitlines() if line.strip()]
+    # ✅ ZMIENIONE: zachowaj pełną listę (żeby nic nie przepadło)
+    questions_raw = [line.strip() for line in phrases_input.splitlines() if line.strip()]
+    questions = questions_raw
     update_status(f"📥 Wczytano frazy: {len(questions)}", 5)
 
     if USE_SEMHASH:
@@ -324,13 +349,15 @@ if st.sidebar.button("Uruchom grupowanie"):
     clusters = merge_similar_clusters(clusters, embeddings, sim_threshold=MERGE_SIM, q2i=q2i)
     update_status(f"🔗 Scalanie podobnych klastrów (próg {MERGE_SIM}): teraz {len(clusters)} klastrów", 70)
 
-    # ✅ DODANE: dedup wewnątrz klastrów po merge (żeby nie wracały powtórki)
     clusters = deduplicate_within_clusters(clusters, threshold=92)
 
     clusters = global_deduplicate_clusters(clusters, threshold=90)
     update_status(f"🧽 Usuwanie duplikatów między klastrami: {len(clusters)} końcowych klastrów", 85)
 
     update_status(f"✅ Pominięto walidację LLM – pozostawiono {len(clusters)} klastrów po klasycznym scaleniu", 90)
+
+    # ✅ DODANE: przypisz WSZYSTKIE oryginalne frazy do klastrów (żeby nie ginęły)
+    clusters_full = assign_raw_phrases_to_clusters(questions_raw, clusters, threshold=92)
 
     # -----------------------------
     # Wczytaj checkpoint i generuj briefy
@@ -350,11 +377,15 @@ if st.sidebar.button("Uruchom grupowanie"):
         try:
             update_status(f"📝 Generuję brief {i}/{total} ({len(qs)} fraz)", int(95 * i / total))
             brief = generate_article_brief(qs, openai_client, model=OPENAI_CHAT_MODEL)
+
+            full_qs = clusters_full.get(label, qs)
+
             rows.append({
                 "cluster_id": label,
-                "main_phrase": pick_main_phrase(qs),  # ✅ ZMIENIONE: stabilny wybór
+                "main_phrase": pick_main_phrase(qs),
                 "intencja": brief.get("intencja", ""),
-                "frazy": ", ".join(qs),
+                "frazy": ", ".join(qs),  # frazy “czyste” (do klastrowania)
+                "frazy_do_uzycia": ", ".join(full_qs),  # ✅ pełna pula (nic nie ginie)
                 "tytul": brief.get("tytul", ""),
                 "wytyczne": brief.get("wytyczne", ""),
             })
@@ -391,6 +422,7 @@ if "excel_buffer" in st.session_state:
     st.success("✅ Zakończono przetwarzanie.")
     st.subheader("📊 Podgląd wyników")
     st.dataframe(pd.DataFrame(st.session_state["results"]))
+
 
 
 
