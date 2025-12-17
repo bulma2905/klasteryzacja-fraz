@@ -3,13 +3,14 @@ import logging
 import os
 import pickle
 import time
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from openai import OpenAI
 from sklearn.cluster import AgglomerativeClustering
+from rapidfuzz import fuzz
 import spacy
 
 import re
@@ -48,6 +49,16 @@ MERGE_SIM = st.sidebar.slider(
 
 USE_LEMMATIZATION = st.sidebar.checkbox("Użyj lematyzacji (spaCy) do embeddingów", value=True)
 
+# ✅ NOWE: sprzątanie po klastrach (dopiero w kroku 2)
+POST_DEDUP_THRESHOLD = st.sidebar.slider(
+    "Post-cluster dedup (RapidFuzz) – próg podobieństwa", 80, 100, 94, 1
+)
+
+# ✅ NOWE: ile fraz maks. wysyłać do GPT (żeby brief był stabilny)
+MAX_PHRASES_FOR_GPT = st.sidebar.slider(
+    "Limit fraz wysyłanych do GPT (reszta zostaje w Excelu)", 20, 300, 120, 10
+)
+
 # -----------------------------
 # Checkpoint cleanup
 # -----------------------------
@@ -58,11 +69,12 @@ if st.sidebar.button("🗑️ Wyczyść checkpoint briefów"):
     else:
         st.sidebar.info("Brak pliku checkpointa do usunięcia.")
 
-st.sidebar.markdown("### ℹ️ Info")
+st.sidebar.markdown("### ℹ️ Logika (ważne)")
 st.sidebar.info("""
-Ta wersja **nie robi semantycznej deduplikacji przed embeddingami**.
-Usuwa tylko identyczne duplikaty (po normalizacji), żeby analiza klastrów była poprawna.
-Briefy generujesz dopiero po analizie – osobnym przyciskiem.
+1) Przed embeddingami usuwamy tylko IDENTYCZNE duplikaty (po normalizacji).
+2) Klastrowanie robi się na pełnych embeddingach (bez fuzz/semhash).
+3) Dopiero PO klastrach robimy semantyczne sprzątanie wewnątrz klastra (RapidFuzz),
+   a do GPT wysyłamy limitowaną listę, ale pełna pula zostaje w Excelu.
 """)
 
 # -----------------------------
@@ -88,7 +100,7 @@ def lemmatize_texts(texts: List[str]) -> List[str]:
     return out
 
 # -----------------------------
-# Normalizacja + EXACT dedup (żeby nie gubić fraz semantycznie)
+# Normalizacja + exact dedup (tylko identyczne)
 # -----------------------------
 def normalize_phrase(s: str) -> str:
     s = str(s).strip().lower()
@@ -98,10 +110,6 @@ def normalize_phrase(s: str) -> str:
     return s
 
 def exact_dedup_keep_first(phrases: List[str]) -> List[str]:
-    """
-    Usuwa tylko IDENTYCZNE duplikaty po normalizacji.
-    Nic semantycznego tu nie ma – nie spłaszcza listy jak RapidFuzz/SemHash.
-    """
     seen = set()
     out = []
     for p in phrases:
@@ -142,7 +150,6 @@ def merge_similar_clusters(
     if not clusters:
         return clusters
 
-    # centroid per cluster
     centroids = {}
     for cid, qs in clusters.items():
         idxs = [q2i[q] for q in qs if q in q2i]
@@ -171,14 +178,56 @@ def merge_similar_clusters(
                 merged[new_id].extend(clusters[cid2])
                 used.add(cid2)
 
-        # usuń identyczne wpisy (literalnie)
-        merged[new_id] = list(dict.fromkeys(merged[new_id]))
+        merged[new_id] = list(dict.fromkeys(merged[new_id]))  # literalnie
         new_id += 1
 
     return merged
 
 def pick_main_phrase(qs: List[str]) -> str:
     return sorted(qs, key=lambda x: (len(normalize_phrase(x)), len(str(x))))[0] if qs else ""
+
+# -----------------------------
+# ✅ POST-CLUSTER: semantyczne sprzątanie wewnątrz klastra (bez utraty w Excelu)
+# -----------------------------
+def dedup_semantic_keep_all(qs: List[str], threshold: int) -> Tuple[List[str], Dict[str, List[str]]]:
+    """
+    Zwraca:
+    - reps: lista reprezentantów (do promptu)
+    - rep2all: mapa rep -> wszystkie podobne frazy (żeby nic nie ginęło)
+    """
+    reps: List[str] = []
+    reps_norm: List[str] = []
+    rep2all: Dict[str, List[str]] = {}
+
+    for q in qs:
+        nq = normalize_phrase(q)
+
+        best_idx = -1
+        best_score = -1
+        for i, rn in enumerate(reps_norm):
+            score = fuzz.token_set_ratio(nq, rn)
+            if score > best_score:
+                best_score = score
+                best_idx = i
+
+        if best_score >= threshold and best_idx >= 0:
+            rep = reps[best_idx]
+            rep2all[rep].append(q)
+        else:
+            reps.append(q)
+            reps_norm.append(nq)
+            rep2all[q] = [q]
+
+    return reps, rep2all
+
+def pick_reps_for_gpt(reps: List[str], rep2all: Dict[str, List[str]], limit: int) -> List[str]:
+    """
+    Wybiera reprezentantów do promptu:
+    - najpierw te, które „pokrywają” najwięcej fraz,
+    - potem docina do limitu.
+    """
+    reps_sorted = sorted(reps, key=lambda r: len(rep2all.get(r, [r])), reverse=True)
+    return reps_sorted[:limit]
 
 # -----------------------------
 # Brief generation (etap 2)
@@ -270,10 +319,9 @@ if st.sidebar.button("1) Uruchom analizę klastrów"):
     phrases = exact_dedup_keep_first(raw)
     update_status(f"🧼 Exact dedup (tylko identyczne): {len(raw)} → {len(phrases)}", 12)
 
-    # embedding inputs
     embed_inputs = lemmatize_texts(phrases) if USE_LEMMATIZATION else phrases
 
-    update_status("🧠 Generowanie embeddingów (pełna lista)...", 35)
+    update_status("🧠 Generowanie embeddingów (bez semantycznego dedupu)...", 35)
     embeddings = embed_texts(openai_client, embed_inputs, model=OPENAI_EMBEDDING_MODEL)
     q2i = {q: i for i, q in enumerate(phrases)}
 
@@ -283,14 +331,13 @@ if st.sidebar.button("1) Uruchom analizę klastrów"):
     clusters = merge_similar_clusters(clusters, embeddings, sim_threshold=MERGE_SIM, q2i=q2i)
     update_status(f"🔗 Scalanie podobnych klastrów: teraz {len(clusters)} klastrów", 75)
 
-    # zapisz do session_state
     st.session_state["clusters"] = clusters
     st.session_state["phrases_count"] = len(phrases)
 
     update_status("✅ Analiza gotowa. Teraz możesz generować briefy (krok 2).", 100)
 
 # -----------------------------
-# BUTTON 2: BRIEFY (dopiero po analizie)
+# BUTTON 2: BRIEFY (post-cluster sprzątanie + limit do GPT)
 # -----------------------------
 if st.sidebar.button("2) Generuj briefy do klastrów"):
     if "clusters" not in st.session_state:
@@ -315,24 +362,35 @@ if st.sidebar.button("2) Generuj briefy do klastrów"):
 
     items = list(clusters.items())
 
-    for i, (cid, qs) in enumerate(items, 1):
+    for i, (cid, qs_full) in enumerate(items, 1):
         if i <= done:
             continue
 
         try:
-            update_status(f"📝 Brief {i}/{total} (klaster: {len(qs)} fraz)", int(95 * i / max(total, 1)))
-            brief = generate_article_brief(qs, openai_client, model=OPENAI_CHAT_MODEL)
+            # ✅ semantyczne sprzątanie w obrębie klastra (ALE pełna lista zostaje)
+            reps, rep2all = dedup_semantic_keep_all(qs_full, threshold=POST_DEDUP_THRESHOLD)
+            reps_for_gpt = pick_reps_for_gpt(reps, rep2all, limit=MAX_PHRASES_FOR_GPT)
+
+            update_status(
+                f"📝 Brief {i}/{total} | klaster: {len(qs_full)} fraz | reps do GPT: {len(reps_for_gpt)}",
+                int(95 * i / max(total, 1))
+            )
+
+            brief = generate_article_brief(reps_for_gpt, openai_client, model=OPENAI_CHAT_MODEL)
 
             rows.append({
                 "cluster_id": cid,
-                "main_phrase": pick_main_phrase(qs),
+                "main_phrase": pick_main_phrase(qs_full),
                 "intencja": brief.get("intencja", ""),
-                "frazy_do_uzycia": ", ".join(qs),
+                "frazy_w_klastrze_pelne": ", ".join(qs_full),          # ✅ NIC NIE GINIE
+                "frazy_reprezentatywne_do_GPT": ", ".join(reps_for_gpt),# ✅ stabilny prompt
                 "tytul": brief.get("tytul", ""),
                 "wytyczne": brief.get("wytyczne", ""),
             })
+
             save_checkpoint(rows)
-            time.sleep(1.2)
+            time.sleep(1.0)
+
         except Exception as e:
             logging.warning(f"⚠️ Błąd przy klastrze {i}/{total}: {e}")
             time.sleep(2)
@@ -342,23 +400,21 @@ if st.sidebar.button("2) Generuj briefy do klastrów"):
     st.session_state["results"] = rows
 
 # -----------------------------
-# EXPORT EXCEL (klastry + briefy jeśli są)
+# EXPORT EXCEL
 # -----------------------------
 if "clusters" in st.session_state:
     clusters = st.session_state["clusters"]
 
-    # sheet: klastry
     clusters_rows = []
     for cid, qs in clusters.items():
         clusters_rows.append({
             "cluster_id": cid,
             "main_phrase": pick_main_phrase(qs),
-            "frazy_w_klastrze": ", ".join(qs),
             "liczba_fraz": len(qs),
+            "frazy_w_klastrze_pelne": ", ".join(qs),
         })
     df_clusters = pd.DataFrame(clusters_rows).sort_values(by="liczba_fraz", ascending=False)
 
-    # sheet: briefy (jeśli są)
     df_briefs = pd.DataFrame(st.session_state.get("results", []))
 
     xlsx_buffer = io.BytesIO()
@@ -382,6 +438,7 @@ if "clusters" in st.session_state:
     if not df_briefs.empty:
         st.subheader("📝 Podgląd briefów")
         st.dataframe(df_briefs)
+
 
 
 
