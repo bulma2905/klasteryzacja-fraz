@@ -16,6 +16,7 @@ import spacy
 import re
 import unidecode
 
+
 # -----------------------------
 # Page Configuration
 # -----------------------------
@@ -49,14 +50,24 @@ MERGE_SIM = st.sidebar.slider(
 
 USE_LEMMATIZATION = st.sidebar.checkbox("Użyj lematyzacji (spaCy) do embeddingów", value=True)
 
-# ✅ NOWE: sprzątanie po klastrach (dopiero w kroku 2)
+# ✅ Post-dedup w obrębie klastra (dopiero w kroku 2)
 POST_DEDUP_THRESHOLD = st.sidebar.slider(
     "Post-cluster dedup (RapidFuzz) – próg podobieństwa", 80, 100, 94, 1
 )
 
-# ✅ NOWE: ile fraz maks. wysyłać do GPT (żeby brief był stabilny)
+# ✅ Limit fraz wysyłanych do GPT
 MAX_PHRASES_FOR_GPT = st.sidebar.slider(
     "Limit fraz wysyłanych do GPT (reszta zostaje w Excelu)", 20, 300, 120, 10
+)
+
+# ✅ Batch embeddingów (stabilność)
+EMBED_BATCH_SIZE = st.sidebar.slider(
+    "Batch embeddingów (stabilność)", 20, 500, 200, 20
+)
+
+# ✅ Iteracyjny merge: ile rund maks (zwykle 5–15 starczy)
+MERGE_MAX_PASSES = st.sidebar.slider(
+    "Maks. rund scalania klastrów (iteracyjnie)", 1, 30, 12, 1
 )
 
 # -----------------------------
@@ -72,10 +83,12 @@ if st.sidebar.button("🗑️ Wyczyść checkpoint briefów"):
 st.sidebar.markdown("### ℹ️ Logika (ważne)")
 st.sidebar.info("""
 1) Przed embeddingami usuwamy tylko IDENTYCZNE duplikaty (po normalizacji).
-2) Klastrowanie robi się na pełnych embeddingach (bez fuzz/semhash).
+2) Klastrowanie robi się na embeddingach (bez fuzz/semhash przed embeddingami).
 3) Dopiero PO klastrach robimy semantyczne sprzątanie wewnątrz klastra (RapidFuzz),
-   a do GPT wysyłamy limitowaną listę, ale pełna pula zostaje w Excelu.
+   a do GPT wysyłamy limitowaną listę reprezentantów, ale pełna pula zostaje w Excelu.
+4) Scalanie klastrów jest ITERACYJNE, żeby uniknąć “dwóch artykułów o tym samym”.
 """)
+
 
 # -----------------------------
 # spaCy
@@ -96,8 +109,10 @@ def lemmatize_texts(texts: List[str]) -> List[str]:
     out = []
     for t in texts:
         doc = nlp(t)
-        out.append(" ".join([token.lemma_.lower() for token in doc if token.lemma_]))
+        lemmas = [token.lemma_.lower() for token in doc if token.lemma_]
+        out.append(" ".join(lemmas) if lemmas else t)
     return out
+
 
 # -----------------------------
 # Normalizacja + exact dedup (tylko identyczne)
@@ -119,13 +134,32 @@ def exact_dedup_keep_first(phrases: List[str]) -> List[str]:
             seen.add(np_)
     return out
 
-# -----------------------------
-# Embeddings + clustering
-# -----------------------------
-def embed_texts(client: OpenAI, texts: List[str], model: str) -> np.ndarray:
-    response = client.embeddings.create(model=model, input=texts)
-    return np.array([d.embedding for d in response.data])
 
+# -----------------------------
+# Embeddings (batch)
+# -----------------------------
+def embed_texts_batched(client: OpenAI, texts: List[str], model: str, batch_size: int = 200) -> np.ndarray:
+    if not texts:
+        return np.zeros((0, 0), dtype=float)
+
+    all_vecs: List[List[float]] = []
+    total = len(texts)
+
+    for i in range(0, total, batch_size):
+        batch = texts[i:i + batch_size]
+        resp = client.embeddings.create(model=model, input=batch)
+        all_vecs.extend([d.embedding for d in resp.data])
+
+        # minimalny „oddech” żeby nie walić rate-limitów
+        if i + batch_size < total:
+            time.sleep(0.05)
+
+    return np.array(all_vecs, dtype=float)
+
+
+# -----------------------------
+# Clustering
+# -----------------------------
 def cluster_questions(questions: List[str], embeddings: np.ndarray, sim_threshold: float) -> Dict[int, List[str]]:
     if not questions:
         return {}
@@ -141,60 +175,90 @@ def cluster_questions(questions: List[str], embeddings: np.ndarray, sim_threshol
         clustered.setdefault(int(label), []).append(q)
     return clustered
 
-def merge_similar_clusters(
+def _centroid(vecs: np.ndarray) -> np.ndarray:
+    c = np.mean(vecs, axis=0)
+    n = np.linalg.norm(c) + 1e-12
+    return c / n
+
+def merge_similar_clusters_iterative(
     clusters: Dict[int, List[str]],
     embeddings: np.ndarray,
     sim_threshold: float,
-    q2i: Dict[str, int]
+    q2i: Dict[str, int],
+    max_passes: int = 12
 ) -> Dict[int, List[str]]:
+    """
+    Iteracyjnie scala klastry po podobieństwie centroidów.
+    Dzięki temu domyka łańcuchy typu: A~B i B~C => A,B,C w 1 klastrze.
+    """
     if not clusters:
         return clusters
 
-    centroids = {}
-    for cid, qs in clusters.items():
-        idxs = [q2i[q] for q in qs if q in q2i]
-        if not idxs:
-            continue
-        centroid = np.mean(embeddings[idxs], axis=0)
-        centroid = centroid / (np.linalg.norm(centroid) + 1e-12)
-        centroids[cid] = centroid
+    # Start: przepisz do listy klastrów jako listy fraz
+    current = [list(dict.fromkeys(qs)) for _, qs in clusters.items()]
 
-    merged: Dict[int, List[str]] = {}
-    used = set()
-    new_id = 0
-    cluster_ids = list(clusters.keys())
-
-    for cid in cluster_ids:
-        if cid in used or cid not in centroids:
-            continue
-        merged[new_id] = list(clusters[cid])
-        used.add(cid)
-
-        for cid2 in cluster_ids:
-            if cid2 in used or cid2 not in centroids:
+    for _pass in range(max_passes):
+        # policz centroidy
+        centroids = []
+        valid_idx = []
+        for idx, qs in enumerate(current):
+            idxs = [q2i[q] for q in qs if q in q2i]
+            if not idxs:
+                centroids.append(None)
                 continue
-            sim = float(np.dot(centroids[cid], centroids[cid2]))
-            if sim >= sim_threshold:
-                merged[new_id].extend(clusters[cid2])
-                used.add(cid2)
+            centroids.append(_centroid(embeddings[idxs]))
+            valid_idx.append(idx)
 
-        merged[new_id] = list(dict.fromkeys(merged[new_id]))  # literalnie
-        new_id += 1
+        used = set()
+        new_clusters = []
+        changed = False
 
+        for i in range(len(current)):
+            if i in used:
+                continue
+            if centroids[i] is None:
+                used.add(i)
+                new_clusters.append(current[i])
+                continue
+
+            group = list(current[i])
+            used.add(i)
+
+            # Scalaj wszystko co przekracza próg (w tej rundzie)
+            for j in range(i + 1, len(current)):
+                if j in used or centroids[j] is None:
+                    continue
+                sim = float(np.dot(centroids[i], centroids[j]))
+                if sim >= sim_threshold:
+                    group.extend(current[j])
+                    used.add(j)
+                    changed = True
+
+            # usuń literalne duplikaty, zachowaj kolejność
+            group = list(dict.fromkeys(group))
+            new_clusters.append(group)
+
+        current = new_clusters
+        if not changed:
+            break
+
+    # Nadaj stabilne ID: sort po main_phrase (żeby checkpoint nie wariował)
+    def main_key(qs: List[str]) -> str:
+        return sorted(qs, key=lambda x: (len(normalize_phrase(x)), len(str(x))))[0] if qs else ""
+
+    current_sorted = sorted(current, key=main_key)
+
+    merged: Dict[int, List[str]] = {i: qs for i, qs in enumerate(current_sorted)}
     return merged
 
 def pick_main_phrase(qs: List[str]) -> str:
     return sorted(qs, key=lambda x: (len(normalize_phrase(x)), len(str(x))))[0] if qs else ""
 
+
 # -----------------------------
-# ✅ POST-CLUSTER: semantyczne sprzątanie wewnątrz klastra (bez utraty w Excelu)
+# Post-cluster: semantyczne sprzątanie w obrębie klastra (bez utraty w Excelu)
 # -----------------------------
 def dedup_semantic_keep_all(qs: List[str], threshold: int) -> Tuple[List[str], Dict[str, List[str]]]:
-    """
-    Zwraca:
-    - reps: lista reprezentantów (do promptu)
-    - rep2all: mapa rep -> wszystkie podobne frazy (żeby nic nie ginęło)
-    """
     reps: List[str] = []
     reps_norm: List[str] = []
     rep2all: Dict[str, List[str]] = {}
@@ -221,13 +285,9 @@ def dedup_semantic_keep_all(qs: List[str], threshold: int) -> Tuple[List[str], D
     return reps, rep2all
 
 def pick_reps_for_gpt(reps: List[str], rep2all: Dict[str, List[str]], limit: int) -> List[str]:
-    """
-    Wybiera reprezentantów do promptu:
-    - najpierw te, które „pokrywają” najwięcej fraz,
-    - potem docina do limitu.
-    """
     reps_sorted = sorted(reps, key=lambda r: len(rep2all.get(r, [r])), reverse=True)
     return reps_sorted[:limit]
+
 
 # -----------------------------
 # Brief generation (etap 2)
@@ -273,6 +333,7 @@ Wytyczne: [2–3 zdania opisu oczekiwań użytkownika]
         logging.warning(f"⚠️ Brief parse failed: {e}")
         return {"intencja": "", "tytul": "", "wytyczne": ""}
 
+
 # -----------------------------
 # UI
 # -----------------------------
@@ -299,6 +360,7 @@ def load_checkpoint(filename="briefs.pkl"):
             return pickle.load(f)
     return []
 
+
 # -----------------------------
 # BUTTON 1: ANALIZA (KLASTRY)
 # -----------------------------
@@ -321,23 +383,35 @@ if st.sidebar.button("1) Uruchom analizę klastrów"):
 
     embed_inputs = lemmatize_texts(phrases) if USE_LEMMATIZATION else phrases
 
-    update_status("🧠 Generowanie embeddingów (bez semantycznego dedupu)...", 35)
-    embeddings = embed_texts(openai_client, embed_inputs, model=OPENAI_EMBEDDING_MODEL)
+    update_status("🧠 Generowanie embeddingów (batch)...", 35)
+    embeddings = embed_texts_batched(
+        openai_client,
+        embed_inputs,
+        model=OPENAI_EMBEDDING_MODEL,
+        batch_size=EMBED_BATCH_SIZE
+    )
     q2i = {q: i for i, q in enumerate(phrases)}
 
     clusters = cluster_questions(phrases, embeddings, sim_threshold=CLUSTER_SIM)
     update_status(f"🧩 Klastrowanie: powstało {len(clusters)} klastrów", 60)
 
-    clusters = merge_similar_clusters(clusters, embeddings, sim_threshold=MERGE_SIM, q2i=q2i)
-    update_status(f"🔗 Scalanie podobnych klastrów: teraz {len(clusters)} klastrów", 75)
+    clusters = merge_similar_clusters_iterative(
+        clusters,
+        embeddings,
+        sim_threshold=MERGE_SIM,
+        q2i=q2i,
+        max_passes=MERGE_MAX_PASSES
+    )
+    update_status(f"🔗 Scalanie (iteracyjne): teraz {len(clusters)} klastrów", 80)
 
     st.session_state["clusters"] = clusters
     st.session_state["phrases_count"] = len(phrases)
 
     update_status("✅ Analiza gotowa. Teraz możesz generować briefy (krok 2).", 100)
 
+
 # -----------------------------
-# BUTTON 2: BRIEFY (post-cluster sprzątanie + limit do GPT)
+# BUTTON 2: BRIEFY
 # -----------------------------
 if st.sidebar.button("2) Generuj briefy do klastrów"):
     if "clusters" not in st.session_state:
@@ -367,7 +441,6 @@ if st.sidebar.button("2) Generuj briefy do klastrów"):
             continue
 
         try:
-            # ✅ semantyczne sprzątanie w obrębie klastra (ALE pełna lista zostaje)
             reps, rep2all = dedup_semantic_keep_all(qs_full, threshold=POST_DEDUP_THRESHOLD)
             reps_for_gpt = pick_reps_for_gpt(reps, rep2all, limit=MAX_PHRASES_FOR_GPT)
 
@@ -382,8 +455,8 @@ if st.sidebar.button("2) Generuj briefy do klastrów"):
                 "cluster_id": cid,
                 "main_phrase": pick_main_phrase(qs_full),
                 "intencja": brief.get("intencja", ""),
-                "frazy_w_klastrze_pelne": ", ".join(qs_full),          # ✅ NIC NIE GINIE
-                "frazy_reprezentatywne_do_GPT": ", ".join(reps_for_gpt),# ✅ stabilny prompt
+                "frazy_w_klastrze_pelne": ", ".join(qs_full),
+                "frazy_reprezentatywne_do_GPT": ", ".join(reps_for_gpt),
                 "tytul": brief.get("tytul", ""),
                 "wytyczne": brief.get("wytyczne", ""),
             })
@@ -398,6 +471,7 @@ if st.sidebar.button("2) Generuj briefy do klastrów"):
 
     update_status("✅ Briefy gotowe.", 100)
     st.session_state["results"] = rows
+
 
 # -----------------------------
 # EXPORT EXCEL
@@ -438,6 +512,7 @@ if "clusters" in st.session_state:
     if not df_briefs.empty:
         st.subheader("📝 Podgląd briefów")
         st.dataframe(df_briefs)
+
 
 
 
