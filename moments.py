@@ -61,7 +61,7 @@ CANN_METHOD = st.sidebar.radio("Metoda wykrywania podobnych klastrów", ["RapidF
 if CANN_METHOD == "RapidFuzz":
     CANN_THRESHOLD_FUZZ = st.sidebar.slider("Próg podobieństwa (RapidFuzz token_set_ratio)", 70, 100, 88, 1)
 else:
-    CANN_THRESHOLD_EMB = st.sidebar.slider("Próg podobieństwa (cosine similarity)", 0.70, 0.99, 0.88, 0.01)
+    CANN_THRESHOLD_EMB = st.sidebar.slider("Próg podobieństwa (cosine similarity)", 0.70, 0.99, 0.83, 0.01)
 
 CANN_TOP_PHRASES = st.sidebar.slider("Ile fraz z klastra brać do porównania CMP", 5, 80, 30, 5)
 
