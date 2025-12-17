@@ -199,10 +199,9 @@ def pick_main_phrase(qs: List[str]) -> str:
     return sorted(qs, key=lambda x: (len(normalize_phrase(x)), len(str(x))))[0] if qs else ""
 
 # -----------------------------
-# ✅ KROK 1.5: Kanibalizacja między klastrami (bez briefów)
+# ✅ KROK 1.5: Kanibalizacja między klastrami (bez briefów) + LOG SCALENIA
 # -----------------------------
 def build_cluster_cmp(main_phrase: str, phrases: List[str], top_n: int) -> str:
-    # bierzemy krótsze/“bardziej rdzeniowe” frazy jako reprezentację klastra
     phrases_sorted = sorted(phrases, key=lambda x: (len(normalize_phrase(x)), len(str(x))))
     top = phrases_sorted[:top_n]
     return normalize_phrase(main_phrase) + " | " + " | ".join([normalize_phrase(x) for x in top])
@@ -220,7 +219,6 @@ def merge_clusters_by_groups(groups: List[List[int]], clusters: Dict[int, List[s
         used.update(group)
         new_id += 1
 
-    # dodaj nieużyte
     for cid, qs in clusters.items():
         if cid not in used:
             merged[new_id] = qs
@@ -228,13 +226,13 @@ def merge_clusters_by_groups(groups: List[List[int]], clusters: Dict[int, List[s
 
     return merged
 
-def find_groups_graph(edges: List[Tuple[int,int]], n: int) -> List[List[int]]:
+def find_groups_graph(edges: List[Tuple[int, int]], n: int) -> List[List[int]]:
     adj = [[] for _ in range(n)]
     for a, b in edges:
         adj[a].append(b)
         adj[b].append(a)
 
-    visited = [False]*n
+    visited = [False] * n
     groups = []
 
     for i in range(n):
@@ -255,7 +253,25 @@ def find_groups_graph(edges: List[Tuple[int,int]], n: int) -> List[List[int]]:
 
     return groups
 
-def cannibalize_clusters_fuzz(clusters: Dict[int, List[str]], top_n: int, threshold: int) -> Tuple[Dict[int, List[str]], int]:
+def build_merge_log(groups_cid: List[List[int]], clusters: Dict[int, List[str]]) -> pd.DataFrame:
+    rows = []
+    for gid, group in enumerate(groups_cid, 1):
+        sizes = [len(clusters.get(cid, [])) for cid in group]
+        rows.append({
+            "merge_group_id": gid,
+            "merged_cluster_ids": ", ".join(map(str, group)),
+            "merged_clusters_count": len(group),
+            "cluster_sizes": ", ".join(map(str, sizes)),
+            "total_phrases_after_merge": int(sum(sizes)),
+            "sample_main_phrases": " | ".join([pick_main_phrase(clusters.get(cid, [])) for cid in group][:6]),
+        })
+    return pd.DataFrame(rows)
+
+def cannibalize_clusters_fuzz_with_log(
+    clusters: Dict[int, List[str]],
+    top_n: int,
+    threshold: int
+) -> Tuple[Dict[int, List[str]], int, pd.DataFrame]:
     cids = list(clusters.keys())
     cmps = []
     for cid in cids:
@@ -265,22 +281,28 @@ def cannibalize_clusters_fuzz(clusters: Dict[int, List[str]], top_n: int, thresh
 
     edges = []
     for i in range(len(cids)):
-        for j in range(i+1, len(cids)):
+        for j in range(i + 1, len(cids)):
             sim = fuzz.token_set_ratio(cmps[i], cmps[j])
             if sim >= threshold:
                 edges.append((cids[i], cids[j]))
 
-    # map cid->index for graph comps
-    cid_to_idx = {cid:i for i, cid in enumerate(cids)}
-    idx_edges = [(cid_to_idx[a], cid_to_idx[b]) for a,b in edges]
+    cid_to_idx = {cid: i for i, cid in enumerate(cids)}
+    idx_edges = [(cid_to_idx[a], cid_to_idx[b]) for a, b in edges]
 
     groups_idx = find_groups_graph(idx_edges, len(cids))
     groups_cid = [[cids[i] for i in g] for g in groups_idx]
 
     merged = merge_clusters_by_groups(groups_cid, clusters)
-    return merged, len(groups_cid)
+    merge_log_df = build_merge_log(groups_cid, clusters)
+    return merged, len(groups_cid), merge_log_df
 
-def cannibalize_clusters_emb(client: OpenAI, clusters: Dict[int, List[str]], top_n: int, threshold: float, model: str) -> Tuple[Dict[int, List[str]], int]:
+def cannibalize_clusters_emb_with_log(
+    client: OpenAI,
+    clusters: Dict[int, List[str]],
+    top_n: int,
+    threshold: float,
+    model: str
+) -> Tuple[Dict[int, List[str]], int, pd.DataFrame]:
     cids = list(clusters.keys())
     cmps = []
     for cid in cids:
@@ -293,7 +315,7 @@ def cannibalize_clusters_emb(client: OpenAI, clusters: Dict[int, List[str]], top
 
     edges_idx = []
     for i in range(len(cids)):
-        for j in range(i+1, len(cids)):
+        for j in range(i + 1, len(cids)):
             if float(sim[i, j]) >= threshold:
                 edges_idx.append((i, j))
 
@@ -301,7 +323,8 @@ def cannibalize_clusters_emb(client: OpenAI, clusters: Dict[int, List[str]], top
     groups_cid = [[cids[i] for i in g] for g in groups_idx]
 
     merged = merge_clusters_by_groups(groups_cid, clusters)
-    return merged, len(groups_cid)
+    merge_log_df = build_merge_log(groups_cid, clusters)
+    return merged, len(groups_cid), merge_log_df
 
 # -----------------------------
 # ✅ KROK 2: Post-cluster dedup do promptu (bez utraty w Excelu)
@@ -437,10 +460,12 @@ if st.sidebar.button("1) Uruchom analizę klastrów"):
 
     st.session_state["clusters"] = clusters
     st.session_state["clusters_stage"] = "po_analizie"
+    st.session_state.pop("merge_log_1_5", None)  # reset logu po nowej analizie
+
     update_status("✅ Krok 1 gotowy. Teraz możesz zrobić 1.5 (kanibalizacja klastrów) albo od razu briefy.", 100)
 
 # -----------------------------
-# BUTTON 1.5: KANIBALIZACJA KLASTRÓW (BEZ BRIEFÓW)
+# BUTTON 1.5: KANIBALIZACJA KLASTRÓW (BEZ BRIEFÓW) + LOG
 # -----------------------------
 if st.sidebar.button("1.5) Wykryj kanibalizację między klastrami (bez briefów)"):
     if "clusters" not in st.session_state:
@@ -455,26 +480,36 @@ if st.sidebar.button("1.5) Wykryj kanibalizację między klastrami (bez briefów
     update_status(f"🔎 Krok 1.5: analizuję kanibalizację na {len(clusters)} klastrach...", 10)
 
     if CANN_METHOD == "RapidFuzz":
-        merged, groups_found = cannibalize_clusters_fuzz(
+        merged, groups_found, merge_log_df = cannibalize_clusters_fuzz_with_log(
             clusters=clusters,
             top_n=CANN_TOP_PHRASES,
             threshold=CANN_THRESHOLD_FUZZ
         )
-        update_status(f"✅ Krok 1.5: znaleziono {groups_found} grup do scalania | klastry: {len(clusters)} → {len(merged)}", 100)
     else:
         client = OpenAI(api_key=OPENAI_API_KEY)
-        merged, groups_found = cannibalize_clusters_emb(
+        merged, groups_found, merge_log_df = cannibalize_clusters_emb_with_log(
             client=client,
             clusters=clusters,
             top_n=CANN_TOP_PHRASES,
             threshold=CANN_THRESHOLD_EMB,
             model=OPENAI_EMBEDDING_MODEL
         )
-        update_status(f"✅ Krok 1.5: znaleziono {groups_found} grup do scalania | klastry: {len(clusters)} → {len(merged)}", 100)
 
     st.session_state["clusters"] = merged
     st.session_state["clusters_stage"] = "po_kanibalizacji"
-    # po zmianie klastrów briefy checkpoint mogą być niezgodne:
+    st.session_state["merge_log_1_5"] = merge_log_df
+
+    update_status(
+        f"✅ Krok 1.5: znaleziono {groups_found} grup do scalania | klastry: {len(clusters)} → {len(merged)}",
+        100
+    )
+
+    if isinstance(merge_log_df, pd.DataFrame) and not merge_log_df.empty:
+        with st.expander("🔗 Scalenia 1.5 – które klastry zostały połączone"):
+            st.dataframe(merge_log_df, use_container_width=True)
+    else:
+        st.info("Nie wykryto grup do scalenia w kroku 1.5.")
+
     st.warning("ℹ️ Po scaleniu klastrów w kroku 1.5 warto wyczyścić checkpoint briefów, jeśli był już robiony wcześniej.")
 
 # -----------------------------
@@ -540,7 +575,7 @@ if st.sidebar.button("2) Generuj briefy do klastrów"):
     st.session_state["results"] = rows
 
 # -----------------------------
-# EXPORT EXCEL
+# EXPORT EXCEL (Klastry + Scalenia_1_5 + Briefy jeśli są)
 # -----------------------------
 if "clusters" in st.session_state:
     clusters = st.session_state["clusters"]
@@ -555,17 +590,22 @@ if "clusters" in st.session_state:
     df_clusters = pd.DataFrame(clusters_rows).sort_values(by="liczba_fraz", ascending=False)
 
     df_briefs = pd.DataFrame(st.session_state.get("results", []))
+    df_merge = st.session_state.get("merge_log_1_5")
 
     xlsx_buffer = io.BytesIO()
     with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
         df_clusters.to_excel(writer, sheet_name="Klastry", index=False)
+
+        if isinstance(df_merge, pd.DataFrame) and not df_merge.empty:
+            df_merge.to_excel(writer, sheet_name="Scalenia_1_5", index=False)
+
         if not df_briefs.empty:
             df_briefs.to_excel(writer, sheet_name="Briefy", index=False)
 
     xlsx_buffer.seek(0)
 
     st.download_button(
-        label="📥 Pobierz Excel (Klastry + Briefy jeśli są)",
+        label="📥 Pobierz Excel (Klastry + Scalenia_1_5 + Briefy jeśli są)",
         data=xlsx_buffer.getvalue(),
         file_name="frazy_klastry_briefy.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -574,9 +614,14 @@ if "clusters" in st.session_state:
     st.subheader("📊 Podgląd klastrów")
     st.dataframe(df_clusters)
 
+    if isinstance(df_merge, pd.DataFrame) and not df_merge.empty:
+        st.subheader("🔗 Podgląd scaleń (Krok 1.5)")
+        st.dataframe(df_merge, use_container_width=True)
+
     if not df_briefs.empty:
         st.subheader("📝 Podgląd briefów")
         st.dataframe(df_briefs)
+
 
 
 
