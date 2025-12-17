@@ -1,10 +1,9 @@
 import io
 import logging
-import json
 import os
 import pickle
 import time
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 import numpy as np
 import pandas as pd
@@ -15,7 +14,6 @@ from sklearn.cluster import AgglomerativeClustering
 from semhash import SemHash
 import spacy
 
-# ✅ DODANE: normalizacja
 import re
 import unidecode
 
@@ -29,10 +27,8 @@ st.set_page_config(
 
 st.sidebar.header("⚙️ Configuration")
 
-# API Key
 OPENAI_API_KEY = st.sidebar.text_input("OpenAI API Key", type="password")
 
-# Models - wybór z listy
 OPENAI_EMBEDDING_MODEL = st.sidebar.selectbox(
     "Model embeddingów",
     ["text-embedding-3-large", "text-embedding-3-small"],
@@ -45,7 +41,6 @@ OPENAI_CHAT_MODEL = st.sidebar.selectbox(
     index=0
 )
 
-# Parameters with explanations
 DEDUP_THRESHOLD = st.sidebar.slider(
     "Deduplication Threshold (RapidFuzz)", 0, 100, 85, 1
 )
@@ -61,7 +56,7 @@ SEMHASH_SIM = st.sidebar.slider(
 USE_SEMHASH = st.sidebar.checkbox("Użyj SemHash do deduplikacji", value=False)
 
 # -----------------------------
-# NOWA FUNKCJA: WYCZYSZCZENIE CHECKPOINTA
+# Checkpoint cleanup
 # -----------------------------
 if st.sidebar.button("🗑️ Wyczyść checkpoint"):
     if os.path.exists("briefs.pkl"):
@@ -70,9 +65,6 @@ if st.sidebar.button("🗑️ Wyczyść checkpoint"):
     else:
         st.sidebar.info("Brak pliku checkpointa do usunięcia.")
 
-# -----------------------------
-# Parametry – objaśnienia
-# -----------------------------
 st.sidebar.markdown("### ℹ️ Objaśnienia parametrów")
 st.sidebar.info("""
 **Deduplication Threshold (RapidFuzz)** – próg podobieństwa (0–100), powyżej którego frazy są traktowane jako duplikaty.  
@@ -82,26 +74,25 @@ st.sidebar.info("""
 """)
 
 # -----------------------------
-# NLP – Lematyzacja (spaCy)
+# spaCy
 # -----------------------------
 @st.cache_resource
 def load_spacy():
     try:
         return spacy.load("pl_core_news_sm")
-    except:
+    except Exception:
         st.warning("⚠️ Musisz zainstalować model spaCy: python -m spacy download pl_core_news_sm")
         return None
 
 nlp = load_spacy()
 
 def lemmatize_texts(texts: List[str]) -> List[str]:
-    """Zwraca lematy tekstów (używane tylko do embeddingów)."""
     if not nlp:
         return texts
     return [" ".join([token.lemma_.lower() for token in nlp(t)]) for t in texts]
 
 # -----------------------------
-# ✅ DODANE: normalizacja fraz
+# Normalizacja
 # -----------------------------
 def normalize_phrase(s: str) -> str:
     s = str(s).strip().lower()
@@ -111,18 +102,33 @@ def normalize_phrase(s: str) -> str:
     return s
 
 # -----------------------------
-# Helpers
+# ✅ DEDUP, ALE NIC NIE GINIE: reps + mapa rep -> wszystkie frazy
 # -----------------------------
-# ✅ ZMIENIONE: dedup na token_set_ratio + normalizacja
-def deduplicate(questions: List[str], threshold: int = 85) -> List[str]:
-    unique = []
-    unique_norm = []
+def deduplicate_with_map(questions: List[str], threshold: int = 85) -> Tuple[List[str], Dict[str, List[str]]]:
+    reps: List[str] = []
+    reps_norm: List[str] = []
+    rep2all: Dict[str, List[str]] = {}
+
     for q in questions:
         nq = normalize_phrase(q)
-        if not any(fuzz.token_set_ratio(nq, u) >= threshold for u in unique_norm):
-            unique.append(q)
-            unique_norm.append(nq)
-    return unique
+
+        best_idx = -1
+        best_score = -1
+        for i, rn in enumerate(reps_norm):
+            score = fuzz.token_set_ratio(nq, rn)
+            if score > best_score:
+                best_score = score
+                best_idx = i
+
+        if best_score >= threshold and best_idx >= 0:
+            rep = reps[best_idx]
+            rep2all[rep].append(q)
+        else:
+            reps.append(q)
+            reps_norm.append(nq)
+            rep2all[q] = [q]
+
+    return reps, rep2all
 
 def semhash_deduplicate(questions: List[str], threshold: float = 0.95) -> List[str]:
     try:
@@ -134,17 +140,16 @@ def semhash_deduplicate(questions: List[str], threshold: float = 0.95) -> List[s
             return result.deduplicated
         elif isinstance(result, list):
             return result
-        else:
-            return deduplicate(questions, threshold=90)
+        return questions
     except Exception as e:
-        logging.warning(f"⚠️ SemHash failed ({e}) → fallback RapidFuzz")
-        return deduplicate(questions, threshold=90)
+        logging.warning(f"⚠️ SemHash failed ({e})")
+        return questions
 
-def embed_texts(client: OpenAI, texts: List[str], model=OPENAI_EMBEDDING_MODEL) -> np.ndarray:
+def embed_texts(client: OpenAI, texts: List[str], model: str) -> np.ndarray:
     response = client.embeddings.create(model=model, input=texts)
     return np.array([d.embedding for d in response.data])
 
-def cluster_questions(questions: List[str], embeddings: np.ndarray, sim_threshold=0.8) -> Dict[int, List[str]]:
+def cluster_questions(questions: List[str], embeddings: np.ndarray, sim_threshold: float = 0.8) -> Dict[int, List[str]]:
     if not questions:
         return {}
     clustering = AgglomerativeClustering(
@@ -159,9 +164,15 @@ def cluster_questions(questions: List[str], embeddings: np.ndarray, sim_threshol
         clustered.setdefault(int(label), []).append(q)
     return clustered
 
-def merge_similar_clusters(clusters: Dict[int, List[str]], embeddings: np.ndarray, sim_threshold=0.85, q2i: Dict[str, int] = None) -> Dict[int, List[str]]:
-    if not clusters:
-        return {}
+def merge_similar_clusters(
+    clusters: Dict[int, List[str]],
+    embeddings: np.ndarray,
+    sim_threshold: float = 0.85,
+    q2i: Dict[str, int] | None = None
+) -> Dict[int, List[str]]:
+    if not clusters or not q2i:
+        return clusters
+
     centroids = {}
     for cid, qs in clusters.items():
         idxs = [q2i[q] for q in qs if q in q2i]
@@ -181,6 +192,7 @@ def merge_similar_clusters(clusters: Dict[int, List[str]], embeddings: np.ndarra
             continue
         merged[new_id] = list(clusters[cid])
         used.add(cid)
+
         for cid2 in cluster_ids:
             if cid2 in used or cid2 not in centroids:
                 continue
@@ -188,62 +200,20 @@ def merge_similar_clusters(clusters: Dict[int, List[str]], embeddings: np.ndarra
             if sim >= sim_threshold:
                 merged[new_id].extend(clusters[cid2])
                 used.add(cid2)
+
+        # usuń identyczne reps w obrębie nowego klastra
+        merged[new_id] = list(dict.fromkeys(merged[new_id]))
         new_id += 1
+
     return merged
 
-# ✅ DODANE: dedup wewnątrz klastrów po merge
-def deduplicate_within_clusters(clusters: Dict[int, List[str]], threshold: int = 92) -> Dict[int, List[str]]:
-    out: Dict[int, List[str]] = {}
-    for cid, qs in clusters.items():
-        qs = list(dict.fromkeys(qs))  # usuń identyczne
-        out[cid] = deduplicate(qs, threshold=threshold)  # usuń semantyczne
-    return out
-
-# ✅ ZMIENIONE: global dedup na token_set_ratio + normalizacja
-def global_deduplicate_clusters(clusters: Dict[int, List[str]], threshold: int = 90) -> Dict[int, List[str]]:
-    seen_norm = []
-    new_clusters: Dict[int, List[str]] = {}
-    for cid, qs in clusters.items():
-        unique_qs = []
-        for q in qs:
-            nq = normalize_phrase(q)
-            if not any(fuzz.token_set_ratio(nq, s) >= threshold for s in seen_norm):
-                unique_qs.append(q)
-                seen_norm.append(nq)
-        if unique_qs:
-            new_clusters[cid] = unique_qs
-    return new_clusters
-
-# ✅ DODANE: stabilny wybór main_phrase
 def pick_main_phrase(qs: List[str]) -> str:
     return sorted(qs, key=lambda x: (len(normalize_phrase(x)), len(str(x))))[0] if qs else ""
 
-# ✅ DODANE: przywracanie „wywalonych” fraz do najbliższego klastra (żeby nie przepadały)
-def assign_raw_phrases_to_clusters(raw_phrases: List[str], clusters: Dict[int, List[str]], threshold: int = 92) -> Dict[int, List[str]]:
-    out = {cid: list(qs) for cid, qs in clusters.items()}
-    cluster_norm = {cid: [normalize_phrase(q) for q in qs] for cid, qs in clusters.items()}
-
-    for rp in raw_phrases:
-        nrp = normalize_phrase(rp)
-        best_cid, best_sim = None, 0
-        for cid, norms in cluster_norm.items():
-            if not norms:
-                continue
-            sim = max(fuzz.token_set_ratio(nrp, n) for n in norms)
-            if sim > best_sim:
-                best_sim = sim
-                best_cid = cid
-        if best_cid is not None and best_sim >= threshold:
-            out[best_cid].append(rp)
-
-    # usuń duplikaty literalne, zachowaj kolejność
-    for cid in out:
-        out[cid] = list(dict.fromkeys(out[cid]))
-    return out
-
-def generate_article_brief(questions: List[str], client: OpenAI | None, model: str = "gpt-4o-mini") -> Dict[str, Any]:
+def generate_article_brief(questions: List[str], client: OpenAI | None, model: str) -> Dict[str, Any]:
     if client is None:
         return {"intencja": "", "frazy": ", ".join(questions), "tytul": "", "wytyczne": ""}
+
     prompt = f"""
 Dla poniższej listy fraz przygotuj dane do planu artykułu.
 
@@ -267,8 +237,9 @@ Wytyczne: [2–3 zdania opisu oczekiwań użytkownika]
         )
         content = resp.choices[0].message.content.strip()
         result = {"intencja": "", "frazy": "", "tytul": "", "wytyczne": ""}
+
         for line in content.splitlines():
-            low = line.lower()
+            low = line.lower().strip()
             if low.startswith("intencja:"):
                 result["intencja"] = line.split(":", 1)[1].strip()
             elif low.startswith("frazy:"):
@@ -277,6 +248,7 @@ Wytyczne: [2–3 zdania opisu oczekiwań użytkownika]
                 result["tytul"] = line.split(":", 1)[1].strip()
             elif low.startswith("wytyczne:"):
                 result["wytyczne"] = line.split(":", 1)[1].strip()
+
         result["frazy"] = result["frazy"] or ", ".join(questions)
         return result
     except Exception as e:
@@ -284,7 +256,7 @@ Wytyczne: [2–3 zdania opisu oczekiwań użytkownika]
         return {"intencja": "", "frazy": ", ".join(questions), "tytul": "", "wytyczne": ""}
 
 # -----------------------------
-# Main App
+# UI
 # -----------------------------
 st.title("🔍 Groupowanie fraz → Excel Brief Pipeline")
 
@@ -299,9 +271,6 @@ def update_status(message: str, progress: int):
 
 phrases_input = st.sidebar.text_area("Wklej frazy, jedna na linię:")
 
-# -----------------------------
-# Checkpoint helpers
-# -----------------------------
 def save_checkpoint(data, filename="briefs.pkl"):
     with open(filename, "wb") as f:
         pickle.dump(data, f)
@@ -313,7 +282,7 @@ def load_checkpoint(filename="briefs.pkl"):
     return []
 
 # -----------------------------
-# Główna logika aplikacji
+# Main logic
 # -----------------------------
 if st.sidebar.button("Uruchom grupowanie"):
     if not phrases_input.strip():
@@ -326,66 +295,66 @@ if st.sidebar.button("Uruchom grupowanie"):
 
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-    # ✅ ZMIENIONE: zachowaj pełną listę (żeby nic nie przepadło)
     questions_raw = [line.strip() for line in phrases_input.splitlines() if line.strip()]
-    questions = questions_raw
-    update_status(f"📥 Wczytano frazy: {len(questions)}", 5)
+    update_status(f"📥 Wczytano frazy: {len(questions_raw)}", 5)
 
+    # ✅ Opcjonalnie: SemHash może “odszumić”, ale MAPA zawsze RapidFuzz (żeby nic nie zginęło)
     if USE_SEMHASH:
-        filtered = semhash_deduplicate(questions, threshold=SEMHASH_SIM)
-        update_status(f"🧹 Deduplication (SemHash {SEMHASH_SIM}): {len(questions)} → {len(filtered)}", 15)
-    else:
-        filtered = deduplicate(questions, threshold=DEDUP_THRESHOLD)
-        update_status(f"🧹 Deduplication (RapidFuzz {DEDUP_THRESHOLD}): {len(questions)} → {len(filtered)}", 15)
+        sem = semhash_deduplicate(questions_raw, threshold=SEMHASH_SIM)
+        update_status(f"🧹 SemHash (info): {len(questions_raw)} → {len(sem)}", 12)
+
+    reps, rep2all = deduplicate_with_map(questions_raw, threshold=DEDUP_THRESHOLD)
+    update_status(f"🧹 Dedup (bez utraty fraz): {len(questions_raw)} → {len(reps)} reprezentantów", 20)
 
     update_status("🧠 Generowanie embeddingów...", 35)
-    lemmatized = lemmatize_texts(filtered)
+    lemmatized = lemmatize_texts(reps)
     embeddings = embed_texts(openai_client, lemmatized, model=OPENAI_EMBEDDING_MODEL)
-    q2i = {q: i for i, q in enumerate(filtered)}
+    q2i = {q: i for i, q in enumerate(reps)}
 
-    clusters = cluster_questions(filtered, embeddings, sim_threshold=CLUSTER_SIM)
-    update_status(f"🧩 Klastrowanie fraz: powstało {len(clusters)} klastrów", 55)
+    clusters = cluster_questions(reps, embeddings, sim_threshold=CLUSTER_SIM)
+    update_status(f"🧩 Klastrowanie reps: {len(clusters)} klastrów", 55)
 
     clusters = merge_similar_clusters(clusters, embeddings, sim_threshold=MERGE_SIM, q2i=q2i)
-    update_status(f"🔗 Scalanie podobnych klastrów (próg {MERGE_SIM}): teraz {len(clusters)} klastrów", 70)
+    update_status(f"🔗 Scalanie klastrów: {len(clusters)} klastrów", 70)
 
-    clusters = deduplicate_within_clusters(clusters, threshold=92)
+    # ✅ KLUCZ: rozszerzamy każdy klaster reps -> wszystkie frazy, nic nie ginie
+    clusters_full: Dict[int, List[str]] = {}
+    for cid, reps_in_cluster in clusters.items():
+        all_phrases = []
+        for r in reps_in_cluster:
+            all_phrases.extend(rep2all.get(r, [r]))
+        clusters_full[cid] = list(dict.fromkeys(all_phrases))  # usuń identyczne
 
-    clusters = global_deduplicate_clusters(clusters, threshold=90)
-    update_status(f"🧽 Usuwanie duplikatów między klastrami: {len(clusters)} końcowych klastrów", 85)
-
-    update_status(f"✅ Pominięto walidację LLM – pozostawiono {len(clusters)} klastrów po klasycznym scaleniu", 90)
-
-    # ✅ DODANE: przypisz WSZYSTKIE oryginalne frazy do klastrów (żeby nie ginęły)
-    clusters_full = assign_raw_phrases_to_clusters(questions_raw, clusters, threshold=92)
+    update_status(f"📦 Przywrócono pełne frazy do klastrów (łącznie: {sum(len(v) for v in clusters_full.values())})", 82)
+    update_status(f"✅ Pominięto globalne kasowanie między klastrami – nic nie przepada", 90)
 
     # -----------------------------
-    # Wczytaj checkpoint i generuj briefy
+    # Checkpoint + briefy
     # -----------------------------
     rows = load_checkpoint()
     done = len(rows)
-    total = len(clusters)
+    total = len(clusters_full)
 
     if done > 0:
         update_status(f"🔁 Wczytano {done} gotowych briefów z checkpointa", 90)
     else:
         update_status("📝 Rozpoczynam generowanie briefów od początku", 90)
 
-    for i, (label, qs) in enumerate(clusters.items(), 1):
+    # ważne: iterujemy po clusters_full (pełne frazy do użycia)
+    items = list(clusters_full.items())
+
+    for i, (label, full_qs) in enumerate(items, 1):
         if i <= done:
             continue
         try:
-            update_status(f"📝 Generuję brief {i}/{total} ({len(qs)} fraz)", int(95 * i / total))
-            brief = generate_article_brief(qs, openai_client, model=OPENAI_CHAT_MODEL)
-
-            full_qs = clusters_full.get(label, qs)
+            update_status(f"📝 Generuję brief {i}/{total} ({len(full_qs)} fraz)", int(95 * i / max(total, 1)))
+            brief = generate_article_brief(full_qs, openai_client, model=OPENAI_CHAT_MODEL)
 
             rows.append({
                 "cluster_id": label,
-                "main_phrase": pick_main_phrase(qs),
+                "main_phrase": pick_main_phrase(full_qs),
                 "intencja": brief.get("intencja", ""),
-                "frazy": ", ".join(qs),  # frazy “czyste” (do klastrowania)
-                "frazy_do_uzycia": ", ".join(full_qs),  # ✅ pełna pula (nic nie ginie)
+                "frazy_do_uzycia": ", ".join(full_qs),   # ✅ pełna pula do artykułu
                 "tytul": brief.get("tytul", ""),
                 "wytyczne": brief.get("wytyczne", ""),
             })
@@ -398,9 +367,6 @@ if st.sidebar.button("Uruchom grupowanie"):
 
     update_status("✅ Wszystkie briefy wygenerowane lub wczytane z checkpointa", 98)
 
-    # -----------------------------
-    # Zapis do Excela
-    # -----------------------------
     df = pd.DataFrame(rows)
     xlsx_buffer = io.BytesIO()
     with pd.ExcelWriter(xlsx_buffer, engine="openpyxl") as writer:
@@ -422,6 +388,7 @@ if "excel_buffer" in st.session_state:
     st.success("✅ Zakończono przetwarzanie.")
     st.subheader("📊 Podgląd wyników")
     st.dataframe(pd.DataFrame(st.session_state["results"]))
+
 
 
 
