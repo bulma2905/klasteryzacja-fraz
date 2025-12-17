@@ -15,6 +15,10 @@ from sklearn.cluster import AgglomerativeClustering
 from semhash import SemHash
 import spacy
 
+# ✅ DODANE: normalizacja
+import re
+import unidecode
+
 # -----------------------------
 # Page Configuration
 # -----------------------------
@@ -97,13 +101,27 @@ def lemmatize_texts(texts: List[str]) -> List[str]:
     return [" ".join([token.lemma_.lower() for token in nlp(t)]) for t in texts]
 
 # -----------------------------
+# ✅ DODANE: normalizacja fraz
+# -----------------------------
+def normalize_phrase(s: str) -> str:
+    s = str(s).strip().lower()
+    s = unidecode.unidecode(s)
+    s = re.sub(r"[^a-z0-9\s]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+# -----------------------------
 # Helpers
 # -----------------------------
+# ✅ ZMIENIONE: dedup na token_set_ratio + normalizacja
 def deduplicate(questions: List[str], threshold: int = 85) -> List[str]:
     unique = []
+    unique_norm = []
     for q in questions:
-        if not any(fuzz.ratio(q, u) >= threshold for u in unique):
+        nq = normalize_phrase(q)
+        if not any(fuzz.token_set_ratio(nq, u) >= threshold for u in unique_norm):
             unique.append(q)
+            unique_norm.append(nq)
     return unique
 
 def semhash_deduplicate(questions: List[str], threshold: float = 0.95) -> List[str]:
@@ -173,18 +191,32 @@ def merge_similar_clusters(clusters: Dict[int, List[str]], embeddings: np.ndarra
         new_id += 1
     return merged
 
+# ✅ DODANE: dedup wewnątrz klastrów po merge
+def deduplicate_within_clusters(clusters: Dict[int, List[str]], threshold: int = 92) -> Dict[int, List[str]]:
+    out: Dict[int, List[str]] = {}
+    for cid, qs in clusters.items():
+        qs = list(dict.fromkeys(qs))  # usuń identyczne
+        out[cid] = deduplicate(qs, threshold=threshold)  # usuń semantyczne
+    return out
+
+# ✅ ZMIENIONE: global dedup na token_set_ratio + normalizacja
 def global_deduplicate_clusters(clusters: Dict[int, List[str]], threshold: int = 90) -> Dict[int, List[str]]:
-    seen = []
+    seen_norm = []
     new_clusters: Dict[int, List[str]] = {}
     for cid, qs in clusters.items():
         unique_qs = []
         for q in qs:
-            if not any(fuzz.ratio(q, s) >= threshold for s in seen):
+            nq = normalize_phrase(q)
+            if not any(fuzz.token_set_ratio(nq, s) >= threshold for s in seen_norm):
                 unique_qs.append(q)
-                seen.append(q)
+                seen_norm.append(nq)
         if unique_qs:
             new_clusters[cid] = unique_qs
     return new_clusters
+
+# ✅ DODANE: stabilny wybór main_phrase
+def pick_main_phrase(qs: List[str]) -> str:
+    return sorted(qs, key=lambda x: (len(normalize_phrase(x)), len(str(x))))[0] if qs else ""
 
 def generate_article_brief(questions: List[str], client: OpenAI | None, model: str = "gpt-4o-mini") -> Dict[str, Any]:
     if client is None:
@@ -292,6 +324,9 @@ if st.sidebar.button("Uruchom grupowanie"):
     clusters = merge_similar_clusters(clusters, embeddings, sim_threshold=MERGE_SIM, q2i=q2i)
     update_status(f"🔗 Scalanie podobnych klastrów (próg {MERGE_SIM}): teraz {len(clusters)} klastrów", 70)
 
+    # ✅ DODANE: dedup wewnątrz klastrów po merge (żeby nie wracały powtórki)
+    clusters = deduplicate_within_clusters(clusters, threshold=92)
+
     clusters = global_deduplicate_clusters(clusters, threshold=90)
     update_status(f"🧽 Usuwanie duplikatów między klastrami: {len(clusters)} końcowych klastrów", 85)
 
@@ -317,7 +352,7 @@ if st.sidebar.button("Uruchom grupowanie"):
             brief = generate_article_brief(qs, openai_client, model=OPENAI_CHAT_MODEL)
             rows.append({
                 "cluster_id": label,
-                "main_phrase": qs[0] if qs else "",
+                "main_phrase": pick_main_phrase(qs),  # ✅ ZMIENIONE: stabilny wybór
                 "intencja": brief.get("intencja", ""),
                 "frazy": ", ".join(qs),
                 "tytul": brief.get("tytul", ""),
@@ -356,6 +391,7 @@ if "excel_buffer" in st.session_state:
     st.success("✅ Zakończono przetwarzanie.")
     st.subheader("📊 Podgląd wyników")
     st.dataframe(pd.DataFrame(st.session_state["results"]))
+
 
 
 
